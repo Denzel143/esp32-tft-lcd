@@ -1,1007 +1,624 @@
-#include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <Preferences.h>
-#include <LittleFS.h>
-#include <esp_heap_caps.h>
-
-// Harus di atas semua fungsi (prototipe otomatis Arduino dibuat sebelum definisi di bawahnya)
-struct Cfg { uint8_t gam, inv, madctl, vh, vl; };
-
-Preferences prefs;
-
-// ===== Pin =====
-#define TFT_CS   5
-#define TFT_DC   21
-#define TFT_RST  22
-#define T_CS     17
-#define T_DO     16
-#define T_CLK    15
-#define T_DIN    2
-
-// ===== Pengaturan =====
-#define SPI_HZ      40000000      // maksimum ESP32 yang masuk akal; turunkan ke 27000000 kalau layar bergaris/rusak
-#define Z_ON        400
-#define Z_OFF       250
-#define JUMP_MAX    90
-#define DEBUG_TOUCH 0
-
-const int W = 320, H = 240;
-const int TOOLBAR_H = 28;
-const int CANVAS_Y  = TOOLBAR_H;
-
-class Panel : public Adafruit_ILI9341 {
-public:
-  Panel(int8_t cs, int8_t dc, int8_t rst) : Adafruit_ILI9341(cs, dc, rst) {}
-  void setSize(int16_t w, int16_t h) { _width = w; _height = h; WIDTH = w; HEIGHT = h; }
-};
-Panel tft(TFT_CS, TFT_DC, TFT_RST);
-
-// ===== Warna dan alat =====
-const uint16_t PAPER = 0xFFFF;
-const uint16_t BAR   = 0x2104;
-const uint16_t palette[8] = {0x0000, 0xF800, 0xFD20, 0x07E0, 0x001F, 0x780F, 0xF81F, 0xA145};
-const int sizeR[4] = {0, 2, 4, 7};
-int colorIdx = 0, sizeIdx = 1;
-bool eraser = false;
-
-// ===== Driver XPT2046 (bit-bang) =====
-uint16_t xptRead(uint8_t cmd) {
-  uint16_t v = 0;
-  digitalWrite(T_CLK, LOW);
-  digitalWrite(T_CS, LOW);
-  delayMicroseconds(2);
-  for (int8_t i = 7; i >= 0; i--) {
-    digitalWrite(T_DIN, (cmd >> i) & 1);
-    delayMicroseconds(1);
-    digitalWrite(T_CLK, HIGH); delayMicroseconds(1);
-    digitalWrite(T_CLK, LOW);  delayMicroseconds(1);
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 TFT - Kirim Gambar via Bluetooth</title>
+<style>
+:root{
+  --bg:#f3f4f7; --card:#ffffff; --ink:#15181e; --mut:#667085; --line:#dde1e8;
+  --acc:#2f6bff; --acc-ink:#ffffff; --ok:#16995a; --err:#d63b3b; --field:#f6f7fa;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0e1014; --card:#171a21; --ink:#e7e9ef; --mut:#8b93a5; --line:#282c36;
+    --acc:#4d83ff; --acc-ink:#ffffff; --ok:#3acb7c; --err:#ff6b6b; --field:#1e222b;
+    color-scheme: dark;
   }
-  digitalWrite(T_DIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(T_CLK, HIGH); delayMicroseconds(1);
-  digitalWrite(T_CLK, LOW);  delayMicroseconds(1);
-  for (uint8_t i = 0; i < 12; i++) {
-    digitalWrite(T_CLK, HIGH); delayMicroseconds(1);
-    v = (v << 1) | (digitalRead(T_DO) ? 1 : 0);
-    digitalWrite(T_CLK, LOW);  delayMicroseconds(1);
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1040px;margin:0 auto;padding:20px 16px 48px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;justify-content:space-between;margin-bottom:16px}
+h1{font-size:20px;margin:0}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--mut);font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--err)}
+.pill.on .dot{background:var(--ok)}
+.pill.on{color:var(--ink)}
+.grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:16px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.card h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin:0 0 12px;font-weight:600}
+.stack>*+*{margin-top:12px}
+canvas{display:block;width:100%;height:auto;aspect-ratio:4/3;background:#000;border-radius:10px;image-rendering:pixelated;border:1px solid var(--line)}
+.drop{position:relative}
+canvas.crop{cursor:grab;touch-action:none}
+canvas.crop:active{cursor:grabbing}
+.drop.over canvas{outline:2px dashed var(--acc);outline-offset:3px}
+.hint{color:var(--mut);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.row.sp{justify-content:space-between}
+button,select,input[type=file]::file-selector-button{font:inherit}
+button{cursor:pointer;border:1px solid var(--line);background:var(--field);color:var(--ink);padding:8px 14px;border-radius:9px}
+button:hover:not(:disabled){border-color:var(--acc)}
+button.primary{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
+button:disabled{opacity:.45;cursor:not-allowed}
+select{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--field);color:var(--ink)}
+label.f{display:block;font-size:13px;color:var(--mut);margin-bottom:4px}
+.ctl{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+.val{font-variant-numeric:tabular-nums;font-size:13px;min-width:56px;text-align:right}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.chk{display:flex;gap:8px;align-items:center}
+.bar{height:10px;border-radius:99px;background:var(--field);border:1px solid var(--line);overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .12s}
+#log{height:150px;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--mut)}
+#log .ok{color:var(--ok)} #log .err{color:var(--err)}
+.note{font-size:12.5px;color:var(--mut)}
+.warn{display:none;background:var(--field);border:1px solid var(--err);color:var(--err);border-radius:10px;padding:10px 12px;margin-bottom:14px;font-size:13.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ESP32 TFT &middot; Kirim Gambar via Bluetooth</h1>
+    <div class="row">
+      <span id="pill" class="pill"><span class="dot"></span><span id="pillTxt">Belum terhubung</span></span>
+      <button id="btnConn" class="primary">Hubungkan</button>
+    </div>
+  </header>
+
+  <div id="warn" class="warn">Browser ini tidak mendukung Web Bluetooth. Gunakan Chrome atau Edge (desktop/Android). Safari/iOS tidak didukung, di iOS bisa pakai aplikasi Bluefy.</div>
+
+  <div class="grid">
+    <!-- Kiri: gambar -->
+    <section class="card stack">
+      <h2>Gambar</h2>
+      <div class="drop" id="drop"><canvas id="cv" width="320" height="240"></canvas></div>
+      <div class="row">
+        <input id="file" type="file" accept="image/*">
+      </div>
+      <div class="seg">
+        <div>
+          <label class="f" for="fit">Penyesuaian ukuran</label>
+          <select id="fit">
+            <option value="cover">Crop (geser, zoom, putar)</option>
+            <option value="contain">Muat semua (bingkai hitam)</option>
+            <option value="stretch">Regangkan</option>
+          </select>
+        </div>
+        <div>
+          <label class="f" for="pktSel">Ukuran paket BLE</label>
+          <select id="pktSel">
+            <option value="0">Otomatis</option>
+            <option value="20">20 (paling aman)</option>
+            <option value="100">100</option>
+            <option value="180">180</option>
+            <option value="244">244</option>
+          </select>
+        </div>
+      </div>
+      <div id="cropBox" class="stack">
+        <div>
+          <label class="f" for="zoom">Zoom</label>
+          <div class="ctl"><input id="zoom" type="range" min="-1" max="0.903" step="0.005" value="0"><span class="val" id="zoomV">1.00x</span></div>
+        </div>
+        <div>
+          <label class="f" for="rot">Putar</label>
+          <div class="ctl"><input id="rot" type="range" min="-180" max="180" step="1" value="0"><span class="val" id="rotV">0&deg;</span></div>
+        </div>
+        <div class="row">
+          <button id="rotL" type="button">&#8634; 90&deg;</button>
+          <button id="rotR" type="button">&#8635; 90&deg;</button>
+          <button id="cropReset" type="button">Reset posisi</button>
+        </div>
+        <div class="note">Seret gambar untuk menggeser. Zoom dengan scroll mouse atau cubit dua jari; dua jari juga bisa memutar. Bingkai preview = isi layar pada zoom 1x. Yang dikirim tetap resolusi penuh (maks. 1920x1080), jadi zoom di layar tetap tajam.</div>
+      </div>
+      <div>
+        <label class="f" for="gam">Gamma software (SOFT)</label>
+        <div class="ctl">
+          <input id="gam" type="range" min="0.5" max="3" step="0.05" value="1.35">
+          <span class="val" id="gamV">1.35</span>
+        </div>
+        <div class="note">Nilai di atas 1 menggelapkan gambar. Preview di atas sama dengan yang dikirim.</div>
+      </div>
+      <div class="row sp">
+        <button id="btnSend" class="primary" disabled>Kirim ke layar</button>
+        <span class="hint" id="sendInfo">Pilih gambar dulu</span>
+      </div>
+      <div class="bar"><i id="prog"></i></div>
+    </section>
+
+    <!-- Kanan: kontrol warna -->
+    <section class="card stack">
+      <h2>Kontrol warna panel</h2>
+      <div class="seg">
+        <div>
+          <label class="f" for="gamSel">GAMMA (kurva)</label>
+          <select id="gamSel">
+            <option value="1">Kurva 1 (bawaan)</option>
+            <option value="2" selected>Kurva 2</option>
+            <option value="4">Kurva 4</option>
+            <option value="8">Kurva 8</option>
+          </select>
+        </div>
+        <div>
+          <label class="f" for="madSel">MADCTL</label>
+          <select id="madSel">
+            <option value="64" selected>0x40 (RGB)</option>
+            <option value="72">0x48 (BGR)</option>
+          </select>
+        </div>
+      </div>
+      <label class="chk"><input id="inv" type="checkbox"> INVERT warna</label>
+      <div>
+        <label class="f" for="vcomSel">VCOM (preset)</label>
+        <select id="vcomSel">
+          <option value="62,40">Bawaan (3E, 28)</option>
+          <option value="43,43" selected>2B, 2B</option>
+          <option value="69,21">45, 15</option>
+          <option value="49,60">31, 3C</option>
+          <option value="manual">Manual</option>
+        </select>
+      </div>
+      <div>
+        <label class="f" for="vh">VCOMH</label>
+        <div class="ctl"><input id="vh" type="range" min="0" max="100" step="1" value="43"><span class="val" id="vhV">0x2B</span></div>
+      </div>
+      <div>
+        <label class="f" for="vl">VCOML</label>
+        <div class="ctl"><input id="vl" type="range" min="0" max="100" step="1" value="43"><span class="val" id="vlV">0x2B</span></div>
+      </div>
+      <label class="chk"><input id="auto" type="checkbox" checked> Terapkan otomatis saat diubah</label>
+      <div class="row">
+        <button id="btnApply" disabled>Terapkan</button>
+        <button id="btnSave" disabled>Simpan permanen di ESP32</button>
+        <button id="btnReset">Setel ke pilihan terbaik</button>
+      </div>
+      <div class="note">Perubahan diterapkan langsung ke panel tanpa mengirim ulang gambar. &ldquo;Simpan permanen&rdquo; membuat ESP32 memakai setelan ini lagi saat dinyalakan.</div>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</div>
+
+<script>
+const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RXU = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const TXU = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const W = 320, H = 240;
+const $ = id => document.getElementById(id);
+
+let dev = null, rx = null, tx = null;
+let chunk = 20, connected = false, busy = false;
+let baseData = null, curData = null, imgSource = null;
+let chain = Promise.resolve();
+let acked = 0, rejected = false;      // kendali aliran dari ESP32
+const waiters = [];
+
+const cv = $('cv'), ctx = cv.getContext('2d', { willReadFrequently: true });
+ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+/* ---------- util ---------- */
+function log(msg, cls) {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const hex = n => '0x' + n.toString(16).toUpperCase().padStart(2, '0');
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+function enqueue(fn) { chain = chain.then(fn, fn); return chain; }
+
+/* ---------- BLE ---------- */
+function waitFor(type, ms) {
+  return new Promise((res, rej) => {
+    const w = { type, res };
+    w.t = setTimeout(() => { const i = waiters.indexOf(w); if (i >= 0) waiters.splice(i, 1); rej(new Error('timeout')); }, ms);
+    waiters.push(w);
+  });
+}
+function onNotify(e) {
+  const v = e.target.value;
+  const type = v.getUint8(0);
+  if (type === 6) { acked = v.getUint32(1); return; }
+  if (type === 7) { rejected = true; log('ESP32 menolak unggahan (melebihi kapasitas penyimpanan)', 'err'); return; }
+  for (let i = 0; i < waiters.length; i++) {
+    if (waiters[i].type === type) {
+      const w = waiters.splice(i, 1)[0];
+      clearTimeout(w.t); w.res(v); return;
+    }
   }
-  for (uint8_t i = 0; i < 3; i++) {
-    digitalWrite(T_CLK, HIGH); delayMicroseconds(1);
-    digitalWrite(T_CLK, LOW);  delayMicroseconds(1);
+  if (type === 3) log('ESP32: unggahan terhenti (timeout)', 'err');
+}
+const writeCtl  = d => rx.writeValueWithResponse ? rx.writeValueWithResponse(d) : rx.writeValue(d);
+const writeFast = d => rx.writeValueWithoutResponse ? rx.writeValueWithoutResponse(d) : rx.writeValue(d);
+
+async function writeRetry(d) {
+  for (let i = 0; i < 10; i++) {
+    try { await writeFast(d); return; }
+    catch (e) { if (i === 9) throw e; await sleep(15 * (i + 1)); }
   }
-  digitalWrite(T_CS, HIGH);
-  return v;
 }
 
-uint16_t rd(uint8_t cmd) {
-  xptRead(cmd);
-  delayMicroseconds(30);
-  return xptRead(cmd);
+function setConnected(on, name) {
+  connected = on;
+  $('pill').classList.toggle('on', on);
+  $('pillTxt').textContent = on ? ('Terhubung: ' + (name || 'ESP32') + ' (paket ' + chunk + ' B)') : 'Belum terhubung';
+  $('btnConn').textContent = on ? 'Putuskan' : 'Hubungkan';
+  refreshButtons();
+}
+function refreshButtons() {
+  $('btnSend').disabled = !(connected && baseData && !busy);
+  $('btnApply').disabled = !(connected && !busy);
+  $('btnSave').disabled = !(connected && !busy);
+  $('sendInfo').textContent = !baseData ? 'Pilih gambar dulu' : (connected ? 'Siap dikirim (resolusi penuh, maks Full HD)' : 'Hubungkan ESP32 dulu');
 }
 
-int lastZ = 0;
-int readZ() {
-  int z1 = rd(0xB0), z2 = rd(0xC0);
-  return z1 + 4095 - z2;
+async function detectChunk() {
+  const manual = parseInt($('pktSel').value, 10);
+  if (manual > 0) { chunk = manual; log('Ukuran paket manual: ' + chunk + ' B'); return; }
+  const ping = new Uint8Array(244); ping[0] = 0x00;
+  const p = waitFor(0, 1500); p.catch(() => {});
+  try {
+    await writeFast(ping);
+    const v = await p;
+    chunk = Math.max(20, Math.min(v.getUint16(1), 244));
+  } catch (e) { chunk = 20; }
+  log('Ukuran paket terdeteksi: ' + chunk + ' B', chunk > 20 ? 'ok' : '');
 }
 
-bool dbgOn = true;   // cetak diagnosa touch ke Serial (ketik 'd' untuk on/off)
+async function queryCap() {
+  const p = waitFor(5, 2500); p.catch(() => {});
+  await writeCtl(Uint8Array.of(0x05));
+  const v = await p;
+  return v.getUint32(1);
+}
 
-bool calReady = false;   // kalibrasi layar sudah tersedia (untuk menampilkan koordinat layar)
+async function connect() {
+  try {
+    dev = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SVC] }, { namePrefix: 'ESP32-TFT' }],
+      optionalServices: [SVC]
+    });
+    dev.addEventListener('gattserverdisconnected', () => { setConnected(false); log('Koneksi terputus', 'err'); });
+    log('Menghubungkan ke ' + (dev.name || 'perangkat') + '...');
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SVC);
+    rx = await svc.getCharacteristic(RXU);
+    tx = await svc.getCharacteristic(TXU);
+    await tx.startNotifications();
+    tx.addEventListener('characteristicvaluechanged', onNotify);
+    await detectChunk();
+    setConnected(true, dev.name);
+    log('Terhubung', 'ok');
+    await sendCfg(false);
+  } catch (e) {
+    log('Gagal terhubung: ' + e.message, 'err');
+    setConnected(false);
+  }
+}
+function disconnect() { if (dev && dev.gatt.connected) dev.gatt.disconnect(); }
 
-// Laporan kanal koordinat XPT2046: X, Y, dan Z (tekanan, dari Z1 dan Z2)
-void touchReport(bool appTouched, bool down, int hits) {
-  int z1 = rd(0xB0), z2 = rd(0xC0), x = rd(0xD0), y = rd(0x90);
-  xptRead(0x80);                                                  // power-down
-  int z = z1 + 4095 - z2;
+/* ---------- kontrol warna ---------- */
+function readCfg() {
+  return {
+    gam: parseInt($('gamSel').value, 10),
+    inv: $('inv').checked ? 1 : 0,
+    mad: parseInt($('madSel').value, 10),
+    vh: parseInt($('vh').value, 10),
+    vl: parseInt($('vl').value, 10)
+  };
+}
+function sendCfg(save) {
+  if (!connected || busy) return Promise.resolve();
+  const c = readCfg();
+  const pkt = Uint8Array.of(0x01, c.gam, c.inv, c.mad, c.vh, c.vl, save ? 1 : 0);
+  return enqueue(async () => {
+    try {
+      const ack = waitFor(1, 2500); ack.catch(() => {});
+      await writeCtl(pkt);
+      await ack;
+      log('Setelan diterapkan: kurva ' + c.gam + ', invert ' + (c.inv ? 'on' : 'off') + ', MADCTL ' + hex(c.mad) +
+          ', VCOM ' + hex(c.vh) + '/' + hex(c.vl) + (save ? ' (disimpan)' : ''), 'ok');
+    } catch (e) { log('Gagal mengirim setelan: ' + e.message, 'err'); }
+  });
+}
+const autoApply = debounce(() => { if ($('auto').checked) sendCfg(false); }, 200);
 
-  const int v[4] = {z1, z2, x, y};
-  bool allLow = true, allHigh = true;
-  for (int i = 0; i < 4; i++) { if (v[i] > 8) allLow = false; if (v[i] < 4087) allHigh = false; }
+function updVcomLabels() { $('vhV').textContent = hex(+$('vh').value); $('vlV').textContent = hex(+$('vl').value); }
+function onVcomPreset() {
+  const v = $('vcomSel').value;
+  if (v !== 'manual') { const [h, l] = v.split(','); $('vh').value = h; $('vl').value = l; }
+  updVcomLabels();
+}
+function onVcomSlider() { $('vcomSel').value = 'manual'; updVcomLabels(); }
 
-  Serial.printf("===== Touch @ %lu ms =====\n", (unsigned long)millis());
-  if (allLow)       Serial.println("Chip : TIDAK merespons, semua kanal 0 (DO selalu LOW: cek DO, CS, VCC/GND)");
-  else if (allHigh) Serial.println("Chip : TIDAK merespons, semua kanal 4095 (DO selalu HIGH: cek DO/CLK/DIN, kabel putus)");
-  else              Serial.println("Chip : merespons");
+function setBest() {
+  $('gamSel').value = '2'; $('inv').checked = false; $('madSel').value = '64';
+  $('vcomSel').value = '43,43'; onVcomPreset();
+  $('gam').value = 1.35; $('gamV').textContent = '1.35'; render();
+}
 
-  const char *st = z >= Z_ON ? "SENTUH" : (z >= Z_OFF ? "lemah (di bawah Z_ON)" : "tidak disentuh");
-  Serial.printf("Z    : %d (Z1=%d, Z2=%d) -> %s  [ambang ON=%d, OFF=%d]\n", z, z1, z2, st, Z_ON, Z_OFF);
-
-  if (z >= Z_OFF) {
-    Serial.printf("X    : %d (%d%%)\n", x, x * 100 / 4095);
-    Serial.printf("Y    : %d (%d%%)\n", y, y * 100 / 4095);
-    if (calReady) { int sx, sy; rawToScreen(x, y, sx, sy); Serial.printf("Layar: (%d, %d)\n", sx, sy); }
+/* ---------- gambar ---------- */
+const crop = { z: 1, x: 0, y: 0, r: 0 };   // zoom, geser (px kanvas), putar (derajat)
+function drawFit(img) {
+  const mode = $('fit').value;
+  const iw = img.width || img.naturalWidth, ih = img.height || img.naturalHeight;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  if (mode === 'stretch') ctx.drawImage(img, 0, 0, W, H);
+  else if (mode === 'cover') {
+    const s = Math.max(W / iw, H / ih) * crop.z;
+    ctx.save();
+    ctx.translate(W / 2 + crop.x, H / 2 + crop.y);
+    ctx.rotate(crop.r * Math.PI / 180);
+    ctx.scale(s, s);
+    ctx.drawImage(img, -iw / 2, -ih / 2);
+    ctx.restore();
   } else {
-    Serial.println("X, Y : - (tidak ada sentuhan)");
+    const s = Math.min(W / iw, H / ih);
+    const dw = iw * s, dh = ih * s;
+    ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
   }
-
-  Serial.printf("Program: sentuhan=%s, down=%d, hits=%d, kalibrasi=%s\n",
-                appTouched ? "DITERIMA" : "tidak", down, hits, calReady ? "siap" : "belum");
-  if (z >= Z_ON && !appTouched && !allHigh && !allLow)
-    Serial.println("Catatan: tekanan terdeteksi tapi program menolaknya (X/Y tidak stabil, curigai noise/suplai daya)");
-  Serial.println();
+  baseData = ctx.getImageData(0, 0, W, H);
+  render();
 }
-
-void sortInts(int *a, int n) {
-  for (int i = 1; i < n; i++) {
-    int k = a[i], j = i - 1;
-    while (j >= 0 && a[j] > k) { a[j + 1] = a[j]; j--; }
-    a[j + 1] = k;
+function render() {
+  if (!baseData) return;
+  const g = parseFloat($('gam').value);
+  const lut = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g));
+  const out = new ImageData(W, H), s = baseData.data, d = out.data;
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[s[i]]; d[i + 1] = lut[s[i + 1]]; d[i + 2] = lut[s[i + 2]]; d[i + 3] = 255; }
+  ctx.putImageData(out, 0, 0);
+  curData = out;
+  refreshButtons();
+}
+function loadFile(f) {
+  if (!f || !f.type.startsWith('image/')) { log('Berkas bukan gambar', 'err'); return; }
+  const url = URL.createObjectURL(f);
+  const img = new Image();
+  img.onload = () => { imgSource = img; crop.z = 1; crop.x = 0; crop.y = 0; crop.r = 0; syncCropUI(); drawFit(img); log('Gambar dimuat: ' + f.name + ' (' + img.naturalWidth + 'x' + img.naturalHeight + ')'); URL.revokeObjectURL(url); };
+  img.onerror = () => log('Gagal membaca gambar', 'err');
+  img.src = url;
+}
+function toRGB565(id) {
+  const s = id.data, out = new Uint8Array(id.width * id.height * 2);
+  for (let i = 0, j = 0; i < s.length; i += 4, j += 2) {
+    const r = s[i], g = s[i + 1], b = s[i + 2];
+    out[j]     = (r & 0xF8) | (g >> 5);
+    out[j + 1] = ((g & 0x1C) << 3) | (b >> 3);
   }
+  return out;
 }
 
-bool touchRaw(int &rx, int &ry, int zMin) {
-  lastZ = readZ();
-  if (lastZ < zMin) { xptRead(0x80); return false; }
+/* ---------- resolusi penuh (maks Full HD) ---------- */
+const MAX_LONG = 1920, MAX_SHORT = 1080;   // Full HD, berlaku juga untuk gambar potret
+const capScale = (w, h) => Math.min(1, MAX_LONG / Math.max(w, h), MAX_SHORT / Math.min(w, h));
 
-  int xs[5], ys[5];
-  for (int i = 0; i < 5; i++) { xs[i] = rd(0xD0); ys[i] = rd(0x90); }
-
-  int zAfter = readZ();
-  xptRead(0x80);
-  if (zAfter < zMin) return false;
-
-  sortInts(xs, 5); sortInts(ys, 5);
-  if (xs[3] - xs[1] > 80 || ys[3] - ys[1] > 80) return false;
-  rx = xs[2]; ry = ys[2];
-  if (rx <= 0 || rx >= 4095 || ry <= 0 || ry >= 4095) return false;
-  return true;
+// Ukuran yang dikirim: resolusi asli; hanya dikecilkan kalau melewati Full HD (atau tidak muat di penyimpanan ESP32).
+function planFull(iw, ih, extra) {
+  const mode = $('fit').value;
+  let w0, h0, ratio43 = true;
+  if (mode === 'contain') { w0 = iw; h0 = ih; ratio43 = false; }                 // gambar apa adanya, layar yang memberi bingkai hitam
+  else if (mode === 'stretch') { w0 = Math.max(iw, ih * 4 / 3); h0 = w0 * 3 / 4; }
+  else { const s = Math.max(W / iw, H / ih) * crop.z; w0 = W / s; h0 = H / s; }   // crop: ukuran area terpilih dalam piksel asli
+  const c = Math.min(capScale(w0, h0), extra);
+  if (ratio43) { const w = Math.max(W, Math.floor(w0 * c / 4) * 4); return { w, h: w * 3 / 4, w0, h0, mode }; }
+  return { w: Math.max(1, Math.round(w0 * c)), h: Math.max(1, Math.round(h0 * c)), w0, h0, mode };
 }
 
-// ===== Kalibrasi 3 titik =====
-bool swapXY = false;
-float kx = 1, ox = 0, ky = 1, oyc = 0;
-
-void saveCal() {
-  prefs.begin("cal", false);
-  prefs.putUChar("ok", 2);
-  prefs.putBool("swap", swapXY);
-  prefs.putFloat("kx", kx);  prefs.putFloat("ox", ox);
-  prefs.putFloat("ky", ky);  prefs.putFloat("oy", oyc);
-  prefs.end();
-  calReady = true;
+function drawFull(img, p) {
+  const c = document.createElement('canvas'); c.width = p.w; c.height = p.h;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  g.fillStyle = '#000'; g.fillRect(0, 0, p.w, p.h);
+  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  if (p.mode === 'cover') {
+    const k = p.w / W, s = Math.max(W / iw, H / ih) * crop.z * k;
+    g.translate(p.w / 2 + crop.x * k, p.h / 2 + crop.y * k);
+    g.rotate(crop.r * Math.PI / 180);
+    g.scale(s, s);
+    g.drawImage(img, -iw / 2, -ih / 2);
+  } else g.drawImage(img, 0, 0, p.w, p.h);
+  return c;
 }
 
-bool loadCal() {
-  prefs.begin("cal", false);
-  bool ok = prefs.getUChar("ok", 0) == 2;
-  if (ok) {
-    swapXY = prefs.getBool("swap", false);
-    kx = prefs.getFloat("kx", 0);  ox  = prefs.getFloat("ox", 0);
-    ky = prefs.getFloat("ky", 0);  oyc = prefs.getFloat("oy", 0);
+function applyGamma(c) {
+  const g = parseFloat($('gam').value), lut = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g));
+  const x = c.getContext('2d'), id = x.getImageData(0, 0, c.width, c.height), d = id.data;
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  x.putImageData(id, 0, 0);
+  return id;
+}
+
+// Thumbnail seukuran layar (dipakai ESP32 saat zoom 1x), diperkecil bertahap supaya halus
+function makeThumb(c) {
+  const fit = Math.min(W / c.width, H / c.height);
+  const tw = Math.max(1, Math.min(W, Math.round(c.width * fit))), th = Math.max(1, Math.min(H, Math.round(c.height * fit)));
+  let cur = c;
+  while ((cur.width >> 1) >= tw && (cur.height >> 1) >= th) {
+    const n = document.createElement('canvas'); n.width = cur.width >> 1; n.height = cur.height >> 1;
+    const g = n.getContext('2d'); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(cur, 0, 0, n.width, n.height); cur = n;
   }
-  prefs.end();
-  if (!ok) return false;
-  // validasi: nilai harus masuk akal
-  if (!(fabsf(kx) > 0.02f && fabsf(kx) < 0.5f && fabsf(ky) > 0.02f && fabsf(ky) < 0.5f)) return false;
-  calReady = true;
-  return true;
+  const t = document.createElement('canvas'); t.width = tw; t.height = th;
+  const g = t.getContext('2d', { willReadFrequently: true }); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  g.drawImage(cur, 0, 0, tw, th);
+  return t;
 }
 
-void crosshair(int x, int y, uint16_t c) {
-  tft.drawFastHLine(x - 10, y, 21, c);
-  tft.drawFastVLine(x, y - 10, 21, c);
-  tft.drawCircle(x, y, 6, c);
-}
+const WINDOW = 12288;   // maksimal byte terkirim yang belum dikonfirmasi ESP32
 
-void waitTouchSample(int &rx, int &ry) {
-  int x = 0, y = 0, n;
-  int xs[24], ys[24];
-  do {
-    int hits = 0;
-    while (hits < 5) { if (touchRaw(x, y, Z_ON)) hits++; else hits = 0; delay(5); }
-    delay(150);
-    n = 0;
-    uint32_t t0 = millis();
-    while (n < 24 && millis() - t0 < 1500) {
-      if (touchRaw(x, y, Z_OFF)) { xs[n] = x; ys[n] = y; n++; }
-      delay(8);
-    }
-    int miss = 0;
-    while (miss < 15) { if (touchRaw(x, y, Z_OFF)) miss = 0; else miss++; delay(10); }
-    delay(200);
-  } while (n < 8);
-  sortInts(xs, n); sortInts(ys, n);
-  rx = xs[n / 2]; ry = ys[n / 2];
-}
+async function sendImage() {
+  if (!connected || !imgSource || busy) return;
+  busy = true; refreshButtons();
+  $('prog').style.width = '0%';
+  acked = 0; rejected = false;
+  try {
+    await chain;
+    const cap = await queryCap();
+    const budget = (cap - W * H * 2) / 2;        // piksel yang muat, sisakan tempat thumbnail
+    if (budget < W * H) throw new Error('penyimpanan ESP32 hanya ' + cap + ' byte. Pilih Partition Scheme dengan LittleFS/SPIFFS lebih besar');
+    const iw = imgSource.naturalWidth || imgSource.width, ih = imgSource.naturalHeight || imgSource.height;
+    const p0 = planFull(iw, ih, 1);
+    let p = p0;
+    if (p0.w * p0.h > budget) p = planFull(iw, ih, Math.sqrt(budget / (p0.w0 * p0.h0)) * 0.995);
+    if (p.w * p.h < p0.w * p0.h) log('Penyimpanan ESP32 terbatas (' + (cap / 1048576).toFixed(2) + ' MB): resolusi diturunkan ke ' + p.w + 'x' + p.h, 'err');
+    else if (capScale(p0.w0, p0.h0) < 1) log('Di atas Full HD: dikompres ke ' + p.w + 'x' + p.h);
+    else log('Resolusi dikirim penuh: ' + p.w + 'x' + p.h);
 
-void calibrate() {
-  const int pts[3][2] = {{20, 20}, {300, 20}, {300, 220}};
-  int raw[3][2];
-  for (int i = 0; i < 3; i++) {
-    tft.fillScreen(PAPER);
-    tft.setTextColor(0x0000, PAPER);
-    tft.setTextSize(2);
-    tft.setCursor(60, 100); tft.print("Kalibrasi");
-    tft.setTextSize(1);
-    tft.setCursor(50, 125); tft.printf("Tekan tengah + dan tahan (%d/3)", i + 1);
-    crosshair(pts[i][0], pts[i][1], 0xF800);
-    waitTouchSample(raw[i][0], raw[i][1]);
-    Serial.printf("Titik %d: raw a=%d b=%d\n", i + 1, raw[i][0], raw[i][1]);
-  }
-  int a1 = raw[0][0], b1 = raw[0][1];
-  int a2 = raw[1][0], b2 = raw[1][1];
-  int a3 = raw[2][0], b3 = raw[2][1];
-  swapXY = abs(a2 - a1) < abs(b2 - b1);
-  int dx = swapXY ? (b2 - b1) : (a2 - a1);
-  int dy = swapXY ? (a3 - a2) : (b3 - b2);
-  if (abs(dx) < 800 || abs(dy) < 800) {
-    Serial.println("Kalibrasi gagal: rentang terlalu kecil, ulangi");
-    delay(1000); calibrate(); return;
-  }
-  kx = 280.0f / dx;
-  ky = 200.0f / dy;
-  if (!swapXY) { ox = 20 - kx * a1; oyc = 20 - ky * b2; }
-  else         { ox = 20 - kx * b1; oyc = 20 - ky * a2; }
-  Serial.printf("Kalibrasi: swap=%d kx=%.4f ox=%.1f ky=%.4f oy=%.1f\n", swapXY, kx, ox, ky, oyc);
-  saveCal();
-}
+    const full = drawFull(imgSource, p);
+    const fullData = applyGamma(full);
+    const thumb = makeThumb(full);
+    const thumbData = thumb.getContext('2d').getImageData(0, 0, thumb.width, thumb.height);
+    const tb = toRGB565(thumbData), ib = toRGB565(fullData);
+    const px = new Uint8Array(tb.length + ib.length);
+    px.set(tb, 0); px.set(ib, tb.length);
 
-void rawToScreen(int rx, int ry, int &sx, int &sy) {
-  float fx = swapXY ? (kx * ry + ox) : (kx * rx + ox);
-  float fy = swapXY ? (ky * rx + oyc) : (ky * ry + oyc);
-  sx = constrain((int)fx, 0, W - 1);
-  sy = constrain((int)fy, 0, H - 1);
-}
-
-// ===== Toolbar =====
-int itemX(int i) { return 2 + 26 * i; }
-
-void drawToolbar() {
-  tft.fillRect(0, 0, W, TOOLBAR_H, BAR);
-  for (int i = 0; i < 8; i++) {
-    tft.fillRect(itemX(i), 2, 24, 24, palette[i]);
-    if (!eraser && i == colorIdx) tft.drawRect(itemX(i) - 1, 1, 26, 26, 0xFFFF);
-  }
-  int x = itemX(8);
-  tft.fillRect(x, 2, 24, 24, 0x4208);
-  if (sizeR[sizeIdx] == 0) tft.drawPixel(x + 12, 14, 0xFFFF);
-  else tft.fillCircle(x + 12, 14, sizeR[sizeIdx], 0xFFFF);
-  x = itemX(9);
-  tft.fillRect(x, 2, 24, 24, 0xC618);
-  tft.setTextColor(0x0000); tft.setTextSize(2);
-  tft.setCursor(x + 6, 6); tft.print("E");
-  if (eraser) tft.drawRect(x - 1, 1, 26, 26, 0xFFFF);
-  x = itemX(10);
-  tft.fillRect(x, 2, 24, 24, 0x4208);
-  tft.drawLine(x + 5, 7, x + 18, 20, 0xF800);
-  tft.drawLine(x + 18, 7, x + 5, 20, 0xF800);
-}
-
-void clearCanvas() { tft.fillRect(0, CANVAS_Y, W, H - CANVAS_Y, PAPER); }
-
-void handleToolbar(int x) {
-  int i = (x - 2) / 26;
-  if (x < 2 || i > 10 || (x - 2) % 26 >= 24) return;
-  if (i < 8)        { colorIdx = i; eraser = false; }
-  else if (i == 8)  { sizeIdx = (sizeIdx + 1) % 4; }
-  else if (i == 9)  { eraser = !eraser; }
-  else if (i == 10) { clearCanvas(); }
-  drawToolbar();
-}
-
-// ===== Menggambar =====
-int curRadius() { return eraser ? sizeR[sizeIdx] * 2 + 3 : sizeR[sizeIdx]; }
-uint16_t curColor() { return eraser ? PAPER : palette[colorIdx]; }
-
-void stroke(int x0, int y0, int x1, int y1) {
-  int r = curRadius();
-  uint16_t c = curColor();
-  y0 = max(y0, CANVAS_Y + r);
-  y1 = max(y1, CANVAS_Y + r);
-  if (r == 0) { tft.drawLine(x0, y0, x1, y1, c); return; }
-  int dx = x1 - x0, dy = y1 - y0;
-  int n = max(abs(dx), abs(dy));
-  if (n == 0) { tft.fillCircle(x1, y1, r, c); return; }
-  int step = max(1, r / 2);
-  for (int i = 0; i <= n; i += step) tft.fillCircle(x0 + dx * i / n, y0 + dy * i / n, r, c);
-  tft.fillCircle(x1, y1, r, c);
-}
-
-// ===== Setelan panel (bisa diubah lewat BLE) =====
-Cfg cfg = {0x02, 0, 0x40, 0x2B, 0x2B};   // default = hasil uji
-Cfg pendingCfg;
-volatile bool cfgDirty = false, cfgSave = false;
-
-void loadCfg() {
-  prefs.begin("tft", false);
-  cfg.gam    = prefs.getUChar("gam", cfg.gam);
-  cfg.inv    = prefs.getUChar("inv", cfg.inv);
-  cfg.madctl = prefs.getUChar("mad", cfg.madctl);
-  cfg.vh     = prefs.getUChar("vh",  cfg.vh);
-  cfg.vl     = prefs.getUChar("vl",  cfg.vl);
-  prefs.end();
-}
-void saveCfg() {
-  prefs.begin("tft", false);
-  prefs.putUChar("gam", cfg.gam);
-  prefs.putUChar("inv", cfg.inv);
-  prefs.putUChar("mad", cfg.madctl);
-  prefs.putUChar("vh",  cfg.vh);
-  prefs.putUChar("vl",  cfg.vl);
-  prefs.end();
-}
-void applyCfg(const Cfg &c) {
-  uint8_t g = c.gam;                 tft.sendCommand(0x26, &g, 1);   // kurva gamma
-  uint8_t m = c.madctl;              tft.sendCommand(0x36, &m, 1);   // MADCTL
-  uint8_t v[2] = {c.vh, c.vl};       tft.sendCommand(0xC5, v, 2);    // VCOM
-  tft.invertDisplay(c.inv);
-}
-
-// ===== Penampil gambar resolusi penuh dengan zoom =====
-// Gambar disimpan dengan resolusi aslinya (maks Full HD) di flash (LittleFS) atau PSRAM. Layar tetap 320x240,
-// tetapi saat di-zoom, piksel diambil dari gambar penuh sehingga detail muncul dan tidak jadi kotak-kotak.
-// Isi penyimpanan: [thumbnail thW x thH][gambar penuh imgW x imgH], RGB565 big-endian.
-#define IMG_FILE "/img.raw"
-#define IMG_MAX  1920              // sisi terpanjang yang diterima
-#define SL_X     296               // kolom slider di tepi kanan
-#define SL_TOP   46
-#define SL_BOT   226
-
-uint16_t imgW = 320, imgH = 240;   // ukuran gambar penuh
-uint16_t thW = 320, thH = 240;     // ukuran thumbnail (pas di layar, dipakai saat zoom 1x)
-uint32_t thBytes = 0;
-bool imgReady = false;
-uint8_t *imgMem = nullptr;         // salinan di PSRAM (kalau ada); kalau tidak, dibaca dari flash
-uint32_t imgMemSize = 0;
-File imgFile;
-uint32_t imgPos = 0;
-bool fsOk = false;
-float fitS = 1.0f;                 // skala agar seluruh gambar muat di layar
-float ZMAX = 4.0f;                 // zoom maksimum (minimal sampai 1:1 dengan piksel asli)
-float zoom = 1.0f, viewX = 0, viewY = 0;   // viewX/Y = pojok kiri-atas jendela (piksel gambar penuh)
-bool draftPending = false;         // tampilan terakhir masih kasar (draft), dihaluskan saat jari diangkat
-
-void clampView() {
-  float ds = fitS * zoom;
-  float ww = W / ds, wh = H / ds;                       // ukuran jendela pandang (piksel gambar penuh)
-  viewX = (ww >= imgW) ? (imgW - ww) / 2 : constrain(viewX, 0.0f, imgW - ww);   // lebih kecil dari layar: di tengah
-  viewY = (wh >= imgH) ? (imgH - wh) / 2 : constrain(viewY, 0.0f, imgH - wh);
-}
-
-void setupView() {
-  fitS = min(W / (float)imgW, H / (float)imgH);
-  ZMAX = max(4.0f, 1.0f / fitS);
-  zoom = 1.0f; viewX = 0; viewY = 0;
-  clampView();
-}
-
-void setZoom(float nz) {
-  nz = constrain(nz, 1.0f, ZMAX);
-  float ds0 = fitS * zoom;
-  float cx = viewX + W / (2 * ds0), cy = viewY + H / (2 * ds0);   // pertahankan titik tengah
-  zoom = nz;
-  float ds = fitS * zoom;
-  viewX = cx - W / (2 * ds);
-  viewY = cy - H / (2 * ds);
-  clampView();
-}
-
-float yToZoom(int y) {
-  float t = (float)(SL_BOT - y) / (SL_BOT - SL_TOP);
-  t = constrain(t, 0.0f, 1.0f);
-  float z = 1.0f + t * (ZMAX - 1.0f);
-  if (z < 1.05f) z = 1.0f;          // mudah mencapai 1.00x
-  if (z > ZMAX - 0.05f) z = ZMAX;
-  return z;
-}
-
-void drawOverlay() {
-  // tombol keluar (kembali ke kanvas)
-  tft.fillRect(SL_X + 2, 2, 20, 20, 0x2104);
-  tft.drawRect(SL_X + 2, 2, 20, 20, 0xFFFF);
-  tft.drawLine(SL_X + 7, 7, SL_X + 17, 17, 0xF800);
-  tft.drawLine(SL_X + 17, 7, SL_X + 7, 17, 0xF800);
-  // label zoom
-  char b[10];
-  snprintf(b, sizeof(b), "%.2fx", zoom);
-  tft.fillRect(SL_X - 8, 26, 32, 12, 0x0000);
-  tft.setTextSize(1);
-  tft.setTextColor(0xFFFF, 0x0000);
-  tft.setCursor(SL_X - 6, 29);
-  tft.print(b);
-  // jalur dan tombol geser
-  tft.fillRect(SL_X + 9, SL_TOP, 6, SL_BOT - SL_TOP, 0x0000);
-  tft.fillRect(SL_X + 11, SL_TOP, 2, SL_BOT - SL_TOP, 0xFFFF);
-  int ky_ = SL_BOT - (int)((zoom - 1.0f) / (ZMAX - 1.0f) * (SL_BOT - SL_TOP));
-  tft.fillCircle(SL_X + 12, ky_, 9, 0x0000);
-  tft.fillCircle(SL_X + 12, ky_, 7, 0x07FF);
-}
-
-// ---- akses data gambar (PSRAM atau flash) ----
-bool imgOpen() {
-  if (!imgReady) return false;
-  if (imgMem) return true;
-  if (!fsOk) return false;
-  imgFile = LittleFS.open(IMG_FILE, "r");
-  imgPos = 0xFFFFFFFF;
-  return (bool)imgFile;
-}
-void imgClose() { if (imgFile) imgFile.close(); }
-void imgRead(uint32_t off, uint8_t *dst, size_t n) {
-  if (imgMem) { memcpy(dst, imgMem + off, n); return; }
-  if (imgPos != off) imgFile.seek(off);
-  int got = imgFile.read(dst, n);
-  if (got < 0) got = 0;
-  if ((size_t)got < n) memset(dst + got, 0, n - got);
-  imgPos = off + got;
-}
-void freeImgMem() {
-  if (imgMem) { heap_caps_free(imgMem); imgMem = nullptr; }
-  imgMemSize = 0;
-}
-void dropImage() {                  // buang gambar tersimpan (unggahan gagal / dibatalkan)
-  freeImgMem();
-  imgReady = false;
-  if (fsOk) LittleFS.remove(IMG_FILE);
-}
-
-// Gambar jendela pandang ke layar 320x240.
-// q = sampel maksimum per sumbu: 1 = cepat (draft, saat menggeser), 3 = halus (rata-rata saat gambar diperkecil).
-// Zoom 1x memakai thumbnail yang sudah dihaluskan browser; zoom lebih besar mengambil dari gambar penuh.
-void renderView(int q) {
-  static uint8_t  seg[IMG_MAX * 2];
-  static uint16_t outRow[320], aR[320], aG[320], aB[320];
-  static uint8_t  aN[320];
-  static int16_t  colIdx[3][320];
-
-  if (!imgOpen()) { drawOverlay(); return; }
-
-  const bool thumb = (zoom <= 1.0f);
-  const float ds = fitS * zoom;                     // piksel layar per piksel gambar penuh
-  const int sw = thumb ? thW : imgW, sh = thumb ? thH : imgH;
-  const uint32_t base = thumb ? 0 : thBytes;
-  const float f = (float)sw / imgW;                 // piksel sumber per piksel gambar penuh
-  const float r = f / ds;                           // piksel sumber per piksel layar (>1 = diperkecil)
-  int n = (r <= 1.05f) ? 1 : min((int)ceilf(r - 0.05f), q);
-  n = constrain(n, 1, 3);
-  const float vx = viewX * f, vy = viewY * f;
-
-  int xmin = sw, xmax = -1;
-  for (int k = 0; k < n; k++)
-    for (int ox = 0; ox < W; ox++) {
-      int xi = (int)floorf(vx + ox * r + (k + 0.5f) * r / n);
-      if (xi < 0 || xi >= sw) xi = -1;               // di luar gambar: hitam
-      colIdx[k][ox] = xi;
-      if (xi >= 0) { if (xi < xmin) xmin = xi; if (xi > xmax) xmax = xi; }
-    }
-  const int segPx = (xmax >= xmin) ? (xmax - xmin + 1) : 0;
-
-  int lastSy = -1000;
-  tft.startWrite();
-  tft.setAddrWindow(0, 0, W, H);
-  for (int oy = 0; oy < H; oy++) {
-    memset(aN, 0, sizeof(aN));
-    memset(aR, 0, sizeof(aR)); memset(aG, 0, sizeof(aG)); memset(aB, 0, sizeof(aB));
-    if (segPx) {
-      for (int k = 0; k < n; k++) {
-        int sy = (int)floorf(vy + oy * r + (k + 0.5f) * r / n);
-        if (sy < 0 || sy >= sh) continue;
-        if (sy != lastSy) {                          // baca hanya potongan baris yang tampak
-          imgRead(base + ((uint32_t)sy * sw + xmin) * 2, seg, (size_t)segPx * 2);
-          lastSy = sy;
-        }
-        for (int kx = 0; kx < n; kx++) {
-          const int16_t *ci = colIdx[kx];
-          for (int ox = 0; ox < W; ox++) {
-            if (ci[ox] < 0) continue;
-            const uint8_t *p = seg + (ci[ox] - xmin) * 2;
-            uint16_t v = ((uint16_t)p[0] << 8) | p[1];
-            aR[ox] += v >> 11; aG[ox] += (v >> 5) & 63; aB[ox] += v & 31; aN[ox]++;
-          }
-        }
+    const be = n => [n >> 8, n & 255];
+    const pay = chunk - 1;
+    const t0 = performance.now();
+    log('Mengirim ' + px.length + ' byte (paket ' + chunk + ' B)...');
+    await writeCtl(Uint8Array.of(0x02, ...be(p.w), ...be(p.h), ...be(thumb.width), ...be(thumb.height)));
+    let n = 0, sent = 0, seen = 0, tSeen = performance.now();
+    for (let off = 0; off < px.length; off += pay) {
+      while (sent - acked > WINDOW) {              // tunggu ESP32 selesai menulis (flash lebih lambat dari BLE)
+        if (rejected) throw new Error('ditolak ESP32');
+        if (!connected) throw new Error('koneksi terputus');
+        if (acked !== seen) { seen = acked; tSeen = performance.now(); }
+        else if (performance.now() - tSeen > 10000) throw new Error('ESP32 berhenti merespons');
+        await sleep(3);
       }
+      if (rejected) throw new Error('ditolak ESP32');
+      const len = Math.min(pay, px.length - off);
+      const pkt = new Uint8Array(len + 1);
+      pkt[0] = 0x03; pkt.set(px.subarray(off, off + len), 1);
+      await writeRetry(pkt);
+      sent += len;
+      if ((++n & 15) === 0) $('prog').style.width = (100 * (off + len) / px.length).toFixed(1) + '%';
     }
-    for (int ox = 0; ox < W; ox++) {
-      uint8_t c = aN[ox];
-      outRow[ox] = c ? (uint16_t)(((aR[ox] / c) << 11) | ((aG[ox] / c) << 5) | (aB[ox] / c)) : 0;
-    }
-    tft.writePixels(outRow, W, true, false);
-  }
-  tft.endWrite();
-  imgClose();
-  draftPending = (q < 3 && !thumb && r > 1.05f);
-  drawOverlay();
-}
-
-// ===== BLE =====
-#define SVC_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define RX_UUID  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-#define TX_UUID  "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-
-BLECharacteristic *txChar = nullptr;
-volatile bool bleConnected = false, uploading = false, imageMode = false, ringOverflow = false;
-volatile uint32_t lastRx = 0;
-uint32_t byteCount = 0, upTotal = 0, ackBytes = 0;
-File upFile;
-bool upFileOk = false;
-#define ACK_EVERY 4096             // ESP32 mengabari browser tiap sekian byte selesai diproses (kendali aliran)
-
-// Antrean paket: callback BLE hanya menyalin, loop() yang menulis ke layar dan flash
-#define RING_SZ 16384
-uint8_t ring[RING_SZ];
-volatile uint32_t rHead = 0, rTail = 0;
-
-bool ringPush(const uint8_t *d, uint16_t n) {
-  uint32_t h = rHead, t = rTail;
-  uint32_t used = (h - t + RING_SZ) % RING_SZ;
-  if (RING_SZ - 1 - used < (uint32_t)n + 2) { ringOverflow = true; return false; }
-  ring[h] = n >> 8;   h = (h + 1) % RING_SZ;
-  ring[h] = n & 255;  h = (h + 1) % RING_SZ;
-  for (uint16_t i = 0; i < n; i++) { ring[h] = d[i]; h = (h + 1) % RING_SZ; }
-  __sync_synchronize();
-  rHead = h;
-  return true;
-}
-
-bool ringPop(uint8_t *out, uint16_t &n) {
-  if (rTail == rHead) return false;
-  __sync_synchronize();
-  uint32_t t = rTail;
-  n = ((uint16_t)ring[t] << 8) | ring[(t + 1) % RING_SZ];
-  t = (t + 2) % RING_SZ;
-  for (uint16_t i = 0; i < n; i++) { out[i] = ring[t]; t = (t + 1) % RING_SZ; }
-  rTail = t;
-  return true;
-}
-
-void notify(const uint8_t *d, size_t n) {
-  if (!bleConnected || !txChar) return;
-  txChar->setValue((uint8_t *)d, n);
-  txChar->notify();
-}
-
-// ===== Animasi loading saat menerima gambar =====
-// Latar diredupkan dengan "pagar" piksel hitam. Piksel asli hanya tersisa di titik (x, y) yang
-// keduanya kelipatan DIM_STEP, jadi: 2 = tersisa 25% (redup), 3 = tersisa 11% (sangat gelap).
-// Animasi hanya menulis piksel yang sudah hitam, sehingga tidak ada kotak latar dan
-// tidak perlu menghapus apa pun di luar lingkaran.
-#define DIM_STEP 2
-#define ANIM_SZ  100               // sisi area animasi (piksel)
-
-GFXcanvas16 *loadCv = nullptr;     // kanvas kecil di RAM tempat lingkaran digambar
-bool animActive = false;
-volatile bool touchReset = false;
-uint32_t animT0 = 0, animLast = 0;
-int animX0 = 0, animY0 = 0;
-
-uint16_t hueColor(float h) {       // warna pelangi penuh (HSV, S=V=1) ke RGB565
-  h = fmodf(h, 360.0f); if (h < 0) h += 360.0f;
-  float hp = h / 60.0f, x = 1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f);
-  float r = 0, g = 0, b = 0;
-  switch ((int)hp) {
-    case 0: r = 1; g = x; break;
-    case 1: r = x; g = 1; break;
-    case 2: g = 1; b = x; break;
-    case 3: g = x; b = 1; break;
-    case 4: r = x; b = 1; break;
-    default: r = 1; b = x; break;
-  }
-  uint8_t R = r * 255, G = g * 255, B = b * 255;
-  return ((R & 0xF8) << 8) | ((G & 0xFC) << 3) | (B >> 3);
-}
-
-void dimScreen() {
-  tft.startWrite();
-  for (int x = 0; x < W; x++) if (x % DIM_STEP) tft.writeFastVLine(x, 0, H, 0x0000);
-  for (int y = 0; y < H; y++) if (y % DIM_STEP) tft.writeFastHLine(0, y, W, 0x0000);
-  tft.endWrite();
-}
-
-void startAnim() {
-  dimScreen();
-  animX0 = (W - ANIM_SZ) / 2; animX0 -= animX0 % DIM_STEP;   // sejajar dengan pola redup
-  animY0 = (H - ANIM_SZ) / 2; animY0 -= animY0 % DIM_STEP;
-  loadCv = new GFXcanvas16(ANIM_SZ, ANIM_SZ);
-  if (loadCv && !loadCv->getBuffer()) { delete loadCv; loadCv = nullptr; }   // RAM tidak cukup: layar redup saja
-  animT0 = millis(); animLast = 0;
-  animActive = true;
-}
-
-void stopAnim() {
-  if (loadCv) { delete loadCv; loadCv = nullptr; }
-  animActive = false;
-}
-
-void animTick() {
-  if (!loadCv) return;
-  uint32_t now = millis();
-  if (now - animLast < 30) return;               // sekitar 30 fps
-  animLast = now;
-  float t = (now - animT0) / 1000.0f;
-  const int C = ANIM_SZ / 2;
-  float ang = t * 3.2f;                          // putaran bersama
-  int rad = 8 + (int)(1.5f * sinf(t * 4.0f));    // denyut kecil
-
-  loadCv->fillScreen(0x0000);
-  for (int i = 0; i < 3; i++) {
-    float a = ang + i * 2.0944f;                              // 120 derajat antar lingkaran
-    float R = 24.0f + 13.0f * sinf(t * 2.1f + i * 1.3f);      // jarak dari pusat berubah-ubah
-    int x = C + (int)(R * cosf(a)), y = C + (int)(R * sinf(a));
-    loadCv->fillCircle(x, y, rad, hueColor(t * 60.0f + i * 120.0f));   // warna berbeda dan bergeser
-  }
-
-  // Tulis hanya piksel milik animasi (yang sudah hitam): kolom lalu baris non-kelipatan DIM_STEP
-  uint16_t *buf = loadCv->getBuffer();
-  static uint16_t colBuf[ANIM_SZ];
-  tft.startWrite();
-  for (int c = 0; c < ANIM_SZ; c++) {
-    if (c % DIM_STEP == 0) continue;
-    for (int r = 0; r < ANIM_SZ; r++) colBuf[r] = buf[r * ANIM_SZ + c];
-    tft.setAddrWindow(animX0 + c, animY0, 1, ANIM_SZ);
-    tft.writePixels(colBuf, ANIM_SZ, true, false);
-  }
-  for (int r = 0; r < ANIM_SZ; r++) {
-    if (r % DIM_STEP == 0) continue;
-    tft.setAddrWindow(animX0, animY0 + r, ANIM_SZ, 1);
-    tft.writePixels(buf + r * ANIM_SZ, ANIM_SZ, true, false);
-  }
-  tft.endWrite();
-}
-
-// Ruang flash yang bisa dipakai gambar (berkas gambar lama dianggap kosong karena akan ditimpa)
-uint32_t flashCap() {
-  if (!fsOk) return 0;
-  uint32_t tot = LittleFS.totalBytes(), used = LittleFS.usedBytes(), old = 0;
-  File f = LittleFS.open(IMG_FILE, "r");
-  if (f) { old = f.size(); f.close(); }
-  uint32_t freeB = tot - used + old;
-  uint32_t margin = 24576 + tot / 100;              // cadangan untuk metadata LittleFS
-  return freeB > margin ? freeB - margin : 0;
-}
-
-// Kapasitas penyimpanan gambar (byte), supaya browser memilih resolusi yang muat
-void sendCap() {
-  uint32_t cap = flashCap();
-  if (psramFound()) {
-    uint32_t ps = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) + imgMemSize;
-    if (ps > cap) cap = ps;
-  }
-  uint8_t r[5] = {0x05, (uint8_t)(cap >> 24), (uint8_t)(cap >> 16), (uint8_t)(cap >> 8), (uint8_t)cap};
-  notify(r, 5);
-}
-
-void rejectUpload() {
-  uint8_t r = 0x07; notify(&r, 1);
-  if (imageMode && !imgReady) { imageMode = false; tft.fillScreen(PAPER); drawToolbar(); }
-}
-
-// Paket mulai: [0x02 imgW(2) imgH(2) thW(2) thH(2)]
-void beginUpload(const uint8_t *p, uint16_t n) {
-  if (upFile) upFile.close();
-  if (n < 9) { rejectUpload(); return; }
-  uint16_t w  = ((uint16_t)p[1] << 8) | p[2], h  = ((uint16_t)p[3] << 8) | p[4];
-  uint16_t tw = ((uint16_t)p[5] << 8) | p[6], th = ((uint16_t)p[7] << 8) | p[8];
-  if (!w || !h || w > IMG_MAX || h > IMG_MAX || !tw || !th || tw > W || th > H) { rejectUpload(); return; }
-  uint32_t tb = (uint32_t)tw * th * 2, total = tb + (uint32_t)w * h * 2;
-
-  freeImgMem();
-  imgReady = false;
-  upFileOk = false;
-  if (psramFound()) imgMem = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
-  if (imgMem) imgMemSize = total;
-  else {
-    if (total > flashCap()) { rejectUpload(); return; }
-    upFile = LittleFS.open(IMG_FILE, "w");
-    upFileOk = (bool)upFile;
-    if (!upFileOk) { rejectUpload(); return; }
-  }
-  imgW = w; imgH = h; thW = tw; thH = th; thBytes = tb; upTotal = total;
-  byteCount = 0; ackBytes = 0; ringOverflow = false;
-  lastRx = millis();
-  uploading = true;
-  startAnim();
-}
-
-void dataChunk(const uint8_t *p, size_t n) {
-  if (!uploading) return;
-  if (byteCount + n > upTotal) n = (upTotal > byteCount) ? (upTotal - byteCount) : 0;   // buang kelebihan
-  if (n == 0) return;
-  if (imgMem) memcpy(imgMem + byteCount, p, n);
-  else if (upFileOk && upFile.write(p, n) != n) upFileOk = false;                       // flash penuh / gagal tulis
-  byteCount += n;
-  lastRx = millis();
-  ackBytes += n;
-  if (ackBytes >= ACK_EVERY) {
-    ackBytes = 0;
-    uint32_t c = byteCount;
-    uint8_t r[5] = {0x06, (uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c};
-    notify(r, 5);
+    const done = waitFor(2, 15000); done.catch(() => {});
+    await writeCtl(Uint8Array.of(0x04));
+    const v = await done;
+    const cnt = v.getUint32(1), ok = v.byteLength > 5 ? v.getUint8(5) === 1 : true;
+    $('prog').style.width = '100%';
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
+    if (cnt === px.length && ok) log('Selesai: ' + cnt + ' byte dalam ' + sec + ' detik', 'ok');
+    else if (!ok) log('ESP32 gagal menyimpan gambar (' + cnt + ' dari ' + px.length + ' byte). Cek ruang LittleFS / Partition Scheme.', 'err');
+    else log('Peringatan: ESP32 menerima ' + cnt + ' dari ' + px.length + ' byte. Coba ukuran paket lebih kecil.', 'err');
+  } catch (e) {
+    log('Gagal mengirim gambar: ' + e.message, 'err');
+  } finally {
+    busy = false; refreshButtons();
   }
 }
 
-void endUpload() {
-  if (!uploading) return;
-  if (upFile) upFile.close();
-  uploading = false;
-  bool ok = (byteCount == upTotal) && (imgMem || upFileOk);
-  uint32_t c = byteCount;
-  uint8_t r[6] = {0x02, (uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c, (uint8_t)(ok ? 1 : 0)};
-  notify(r, 6);
-  stopAnim();
-  if (ok) {
-    imgReady = true;
-    imageMode = true;
-    setupView();
-    renderView(3);
-  } else {
-    dropImage();
-    imageMode = false;
-    tft.fillScreen(PAPER);
-    drawToolbar();
-  }
-  // abaikan jari yang masih menempel supaya tidak memicu aksi
-  int tx_, ty_; uint32_t tw = millis();
-  while (touchRaw(tx_, ty_, Z_OFF) && millis() - tw < 800) delay(10);
-  touchReset = true;
+/* ---------- event ---------- */
+if (!navigator.bluetooth) { $('warn').style.display = 'block'; $('btnConn').disabled = true; }
+$('btnConn').onclick = () => connected ? disconnect() : connect();
+$('file').onchange = e => loadFile(e.target.files[0]);
+$('fit').onchange = () => { syncCropUI(); if (imgSource) drawFit(imgSource); };
+$('gam').oninput = () => { $('gamV').textContent = (+$('gam').value).toFixed(2); render(); };
+$('btnSend').onclick = sendImage;
+$('btnApply').onclick = () => sendCfg(false);
+$('btnSave').onclick = () => sendCfg(true);
+$('btnReset').onclick = () => { setBest(); if (connected) sendCfg(false); };
+['gamSel', 'inv', 'madSel'].forEach(id => $(id).addEventListener('change', autoApply));
+$('vcomSel').addEventListener('change', () => { onVcomPreset(); autoApply(); });
+['vh', 'vl'].forEach(id => $(id).addEventListener('input', () => { onVcomSlider(); autoApply(); }));
+$('pktSel').addEventListener('change', () => { if (connected) detectChunk().then(() => setConnected(true, dev && dev.name)); });
+
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => loadFile(e.dataTransfer.files[0]));
+
+/* ---------- crop interaktif ---------- */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const normDeg = d => { d = ((d + 180) % 360 + 360) % 360 - 180; return d; };
+let raf = 0;
+function redraw() { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; if (imgSource) drawFit(imgSource); }); }
+function isCrop() { return $('fit').value === 'cover'; }
+function syncCropUI() {
+  $('cropBox').style.display = isCrop() ? '' : 'none';
+  cv.classList.toggle('crop', isCrop() && !!imgSource);
+  $('zoom').value = Math.log10(crop.z);
+  $('zoomV').textContent = crop.z.toFixed(2) + 'x';
+  $('rot').value = Math.round(crop.r);
+  $('rotV').textContent = Math.round(crop.r) + '\u00B0';
+}
+// zoom dengan titik (cx,cy) relatif terhadap pusat bingkai tetap diam
+function zoomAt(cx, cy, k) {
+  const nz = clamp(crop.z * k, 0.1, 8), kk = nz / crop.z;
+  crop.x = cx - (cx - crop.x) * kk; crop.y = cy - (cy - crop.y) * kk; crop.z = nz;
+}
+function rotAt(cx, cy, dth) {
+  const c = Math.cos(dth), s = Math.sin(dth), vx = crop.x - cx, vy = crop.y - cy;
+  crop.x = cx + vx * c - vy * s; crop.y = cy + vx * s + vy * c;
+  crop.r = normDeg(crop.r + dth * 180 / Math.PI);
+}
+function cpos(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width - W / 2, y: (e.clientY - r.top) * H / r.height - H / 2 };
 }
 
-class SrvCb : public BLEServerCallbacks {
-  void onConnect(BLEServer *) { bleConnected = true; }
-  void onDisconnect(BLEServer *) {
-    bleConnected = false; uploading = false;
-    BLEDevice::startAdvertising();
-  }
-};
-
-// Paket: [0x00] ping | [0x01 gam inv madctl vh vl save] setelan
-//        [0x02 imgW imgH thW thH] mulai gambar | [0x03 data...] RGB565 big-endian (thumbnail dulu, lalu gambar penuh)
-//        [0x04] selesai | [0x05] tanya kapasitas penyimpanan
-// Notifikasi ke browser: 0x00 ping | 0x01 setelan | 0x02 selesai | 0x03 timeout | 0x05 kapasitas | 0x06 kemajuan | 0x07 ditolak
-class RxCb : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) {
-    uint8_t *d = c->getData();
-    size_t n = c->getLength();
-    if (n == 0) return;
-    switch (d[0]) {
-      case 0x00: { uint8_t r[3] = {0x00, (uint8_t)(n >> 8), (uint8_t)n}; notify(r, 3); } break;
-      case 0x01:
-        if (n >= 7) {
-          pendingCfg.gam = d[1]; pendingCfg.inv = d[2]; pendingCfg.madctl = d[3];
-          pendingCfg.vh = d[4];  pendingCfg.vl = d[5];
-          cfgSave = d[6];
-          cfgDirty = true;
-        }
-        break;
-      case 0x02: case 0x03: case 0x04: case 0x05:
-        ringPush(d, (uint16_t)n);
-        break;
-    }
-  }
-};
-
-void startBLE() {
-  BLEDevice::init("ESP32-TFT");
-  BLEDevice::setMTU(517);
-  BLEServer *server = BLEDevice::createServer();
-  server->setCallbacks(new SrvCb());
-  BLEService *svc = server->createService(SVC_UUID);
-
-  BLECharacteristic *rx = svc->createCharacteristic(
-      RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
-  rx->setCallbacks(new RxCb());
-
-  txChar = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  txChar->addDescriptor(new BLE2902());
-
-  svc->start();
-  BLEAdvertising *adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(SVC_UUID);
-  adv->setScanResponse(true);
-  BLEDevice::startAdvertising();
+const pts = new Map();
+let pinch = null;
+function pinchState() {
+  const [a, b] = [...pts.values()];
+  return { d: Math.hypot(b.x - a.x, b.y - a.y) || 1, a: Math.atan2(b.y - a.y, b.x - a.x), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
 }
-
-// Beri kesempatan kalibrasi ulang: sentuh dan tahan layar saat boot
-bool wantRecalibrate() {
-  tft.fillScreen(PAPER);
-  tft.setTextColor(0x0000, PAPER);
-  tft.setTextSize(1);
-  tft.setCursor(30, 110); tft.print("Sentuh & tahan layar untuk kalibrasi ulang");
-  uint32_t t0 = millis();
-  int hits = 0, x, y;
-  while (millis() - t0 < 1500) {
-    if (touchRaw(x, y, Z_ON)) hits++; else hits = 0;
-    if (hits >= 4) {
-      int miss = 0;                                   // tunggu jari diangkat
-      while (miss < 15) { if (touchRaw(x, y, Z_OFF)) miss = 0; else miss++; delay(10); }
-      delay(300);
-      return true;
-    }
-    delay(5);
+cv.addEventListener('pointerdown', e => {
+  if (!isCrop() || !imgSource) return;
+  cv.setPointerCapture(e.pointerId);
+  pts.set(e.pointerId, cpos(e));
+  pinch = pts.size === 2 ? pinchState() : null;
+});
+cv.addEventListener('pointermove', e => {
+  if (!pts.has(e.pointerId)) return;
+  const p = cpos(e), old = pts.get(e.pointerId);
+  pts.set(e.pointerId, p);
+  if (pts.size === 1) { crop.x += p.x - old.x; crop.y += p.y - old.y; }
+  else if (pts.size === 2 && pinch) {
+    const cur = pinchState();
+    crop.x += cur.mx - pinch.mx; crop.y += cur.my - pinch.my;
+    zoomAt(cur.mx, cur.my, cur.d / pinch.d);
+    rotAt(cur.mx, cur.my, cur.a - pinch.a);
+    pinch = cur;
   }
-  return false;
-}
+  syncCropUI(); redraw();
+});
+['pointerup', 'pointercancel'].forEach(t => cv.addEventListener(t, e => {
+  pts.delete(e.pointerId);
+  pinch = pts.size === 2 ? pinchState() : null;
+}));
+cv.addEventListener('wheel', e => {
+  if (!isCrop() || !imgSource) return;
+  e.preventDefault();
+  const p = cpos(e);
+  zoomAt(p.x, p.y, Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015)));
+  syncCropUI(); redraw();
+}, { passive: false });
 
-// Perintah Serial: c = hapus kalibrasi & ulangi, d = debug on/off, h = bantuan
-void handleSerial() {
-  while (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == 'd') { dbgOn = !dbgOn; Serial.printf("Debug touch: %s\n", dbgOn ? "ON" : "OFF"); }
-    else if (ch == 'c') {
-      Serial.println("Hapus kalibrasi dari NVS, mulai kalibrasi ulang...");
-      prefs.begin("cal", false); prefs.clear(); prefs.end();
-      imageMode = false;
-      calibrate();
-      tft.fillScreen(PAPER);
-      drawToolbar();
-    }
-    else if (ch == 'h') Serial.println("Perintah: c = kalibrasi ulang, d = debug on/off");
-  }
-}
+$('zoom').oninput = () => { zoomAt(0, 0, Math.pow(10, +$('zoom').value) / crop.z); syncCropUI(); redraw(); };
+$('rot').oninput = () => { rotAt(0, 0, (+$('rot').value - crop.r) * Math.PI / 180); syncCropUI(); redraw(); };
+$('rotL').onclick = () => { rotAt(0, 0, -Math.PI / 2); syncCropUI(); redraw(); };
+$('rotR').onclick = () => { rotAt(0, 0, Math.PI / 2); syncCropUI(); redraw(); };
+$('cropReset').onclick = () => { crop.z = 1; crop.x = 0; crop.y = 0; crop.r = 0; syncCropUI(); redraw(); };
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(TFT_CS, OUTPUT); digitalWrite(TFT_CS, HIGH);
-  pinMode(T_CS, OUTPUT);   digitalWrite(T_CS, HIGH);
-  pinMode(T_CLK, OUTPUT);  digitalWrite(T_CLK, LOW);
-  pinMode(T_DIN, OUTPUT);  digitalWrite(T_DIN, LOW);
-  pinMode(T_DO, INPUT);
-
-  loadCfg();
-  fsOk = LittleFS.begin(true);          // true = format otomatis kalau belum ada
-  if (!fsOk) Serial.println("LittleFS gagal: zoom gambar tidak tersedia (cek Partition Scheme)");
-
-  tft.begin(SPI_HZ);
-  tft.setSize(W, H);
-  applyCfg(cfg);
-  tft.fillScreen(PAPER);
-
-  Serial.println("--- Diagnostik touch (jangan sentuh layar dulu) ---");
-  Serial.printf("Pin: CS=%d DO=%d CLK=%d DIN=%d\n", T_CS, T_DO, T_CLK, T_DIN);
-  touchReport(false, false, 0);
-  Serial.println("Ketik 'h' untuk daftar perintah.");
-
-  bool calOk = loadCal();
-  Serial.printf("Kalibrasi NVS: %s\n", calOk ? "ADA" : "tidak ada/tidak valid");
-  if (calOk) Serial.printf("  swap=%d kx=%.4f ox=%.1f ky=%.4f oy=%.1f\n", swapXY, kx, ox, ky, oyc);
-  bool recal = calOk ? wantRecalibrate() : true;
-  if (recal) calibrate();
-  else Serial.println("Kalibrasi dimuat dari NVS");
-
-  tft.fillScreen(PAPER);
-  drawToolbar();
-
-  startBLE();
-}
-
-void loop() {
-  handleSerial();
-
-  // ---- proses paket BLE dari antrean ----
-  static uint8_t pkt[520];
-  uint16_t pn;
-  while (ringPop(pkt, pn)) {
-    if (pn == 0) continue;
-    switch (pkt[0]) {
-      case 0x02: beginUpload(pkt, pn); break;
-      case 0x03: dataChunk(pkt + 1, pn - 1); break;
-      case 0x04: endUpload(); break;
-      case 0x05: sendCap(); break;
-    }
-  }
-  if (!uploading && upFile) upFile.close();       // koneksi putus di tengah unggahan
-  if (animActive && !uploading) {                 // unggahan gagal/terputus: kembali ke kanvas
-    stopAnim();
-    dropImage();
-    imageMode = false;
-    tft.fillScreen(PAPER);
-    drawToolbar();
-  }
-
-  if (uploading) {                                // selama menerima: animasi saja, tanpa touch
-    if (millis() - lastRx > 6000) { uploading = false; uint8_t r = 0x03; notify(&r, 1); }
-    if (animActive) animTick();
-    delay(1);
-    return;
-  }
-
-  // ---- setelan baru dari BLE ----
-  if (cfgDirty) {
-    cfgDirty = false;
-    cfg = pendingCfg;
-    applyCfg(cfg);
-    bool sv = cfgSave;
-    if (sv) saveCfg();
-    uint8_t r[2] = {0x01, (uint8_t)(sv ? 1 : 0)};
-    notify(r, 2);
-  }
-
-  static bool down = false, penActive = false, sliderActive = false, panActive = false;
-  static int lx, ly, px, py, miss = 0, hits = 0, rejects = 0;
-  static float fx, fy;
-
-  if (touchReset) {                               // setelah unggahan: bersihkan status sentuhan
-    touchReset = false;
-    down = penActive = sliderActive = panActive = false;
-    hits = 0; miss = 3; rejects = 0;
-  }
-
-  int rx = 0, ry = 0;
-  bool t = touchRaw(rx, ry, down ? Z_OFF : Z_ON);
-
-  if (dbgOn) {
-    static uint32_t tdbg = 0;
-    if (millis() - tdbg > 500) {
-      tdbg = millis();
-      touchReport(t, down, hits);
-    }
-  }
-
-  if (t) {
-    miss = 0;
-    int x, y;
-    rawToScreen(rx, ry, x, y);
-
-    if (!down) {
-      if (hits > 0 && abs(x - px) < 25 && abs(y - py) < 25) hits++; else hits = 1;
-      px = x; py = y;
-      if (hits >= 3) {
-        down = true; hits = 0; rejects = 0;
-        sliderActive = panActive = penActive = false;
-        if (imageMode) {
-          if (x >= SL_X - 8 && y < 30) {
-            // tombol X: kembali ke kanvas
-            imageMode = false;
-            tft.fillScreen(PAPER);
-            drawToolbar();
-          } else if (x >= SL_X - 8) {
-            sliderActive = true;
-            float nz = yToZoom(y);
-            if (nz != zoom) { setZoom(nz); renderView(1); }
-          } else if (zoom > 1.0f) {
-            panActive = true;
-            lx = x; ly = y;
-          }
-        } else if (y < TOOLBAR_H) {
-          handleToolbar(x);
-        } else {
-          penActive = true;
-          fx = x; fy = y; lx = x; ly = y;
-          stroke(lx, ly, lx, ly);
-        }
-      }
-    } else if (imageMode) {
-      if (sliderActive) {
-        float nz = yToZoom(y);
-        if (nz != zoom && (fabsf(nz - zoom) >= 0.04f || nz == 1.0f || nz == ZMAX)) {
-          setZoom(nz);
-          renderView(1);
-        }
-      } else if (panActive) {
-        int dx = x - lx, dy = y - ly;
-        if (abs(dx) > JUMP_MAX || abs(dy) > JUMP_MAX) { lx = x; ly = y; return; }
-        if (abs(dx) + abs(dy) >= 2) {
-          viewX -= dx / (fitS * zoom);
-          viewY -= dy / (fitS * zoom);
-          clampView();
-          lx = x; ly = y;
-          renderView(1);
-        }
-      }
-    } else if (penActive) {
-      if (abs(x - lx) > JUMP_MAX || abs(y - ly) > JUMP_MAX) {
-        if (++rejects >= 3) { fx = x; fy = y; lx = x; ly = y; rejects = 0; }
-        return;
-      }
-      rejects = 0;
-      fx = fx * 0.4f + x * 0.6f;
-      fy = fy * 0.4f + y * 0.6f;
-      int nx = (int)fx, ny = (int)fy;
-      if (nx != lx || ny != ly) {
-        stroke(lx, ly, nx, ny);
-        lx = nx; ly = ny;
-      }
-    }
-  } else {
-    hits = 0;
-    if (++miss >= 3) {
-      if (down && imageMode && draftPending) { draftPending = false; renderView(3); }   // jari diangkat: haluskan tampilan
-      down = false; penActive = sliderActive = panActive = false; miss = 3; rejects = 0;
-    }
-  }
-}
+updVcomLabels();
+syncCropUI();
+refreshButtons();
+log('Siap. Klik Hubungkan dan pilih ESP32-TFT.');
+</script>
+</body>
+</html>
