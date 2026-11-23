@@ -99,6 +99,11 @@ input[type=range]{width:100%;accent-color:var(--acc)}
           </select>
         </div>
       </div>
+      <div>
+        <label class="f" for="resSel">Resolusi dikirim</label>
+        <select id="resSel" disabled><option>Pilih gambar dulu</option></select>
+        <div class="note">Tertinggi = resolusi asli (maks. Full HD, tidak pernah melebihi gambarnya). Makin kecil: kirim lebih cepat dan hemat penyimpanan, tetapi zoom di layar kurang tajam.</div>
+      </div>
       <div id="cropBox" class="stack">
         <div>
           <label class="f" for="zoom">Zoom</label>
@@ -287,7 +292,7 @@ async function connect() {
       filters: [{ services: [SVC] }, { namePrefix: 'ESP32-TFT' }],
       optionalServices: [SVC]
     });
-    dev.addEventListener('gattserverdisconnected', () => { setConnected(false); log('Koneksi terputus', 'err'); });
+    dev.addEventListener('gattserverdisconnected', () => { setConnected(false); devCap = null; syncRes(); log('Koneksi terputus', 'err'); });
     log('Menghubungkan ke ' + (dev.name || 'perangkat') + '...');
     const srv = await dev.gatt.connect();
     const svc = await srv.getPrimaryService(SVC);
@@ -297,6 +302,8 @@ async function connect() {
     tx.addEventListener('characteristicvaluechanged', onNotify);
     await detectChunk();
     setConnected(true, dev.name);
+    try { devCap = await queryCap(); log('Penyimpanan gambar ESP32: ' + fmtMB(devCap)); } catch (e) { devCap = null; }
+    syncRes();
     log('Terhubung', 'ok');
     await sendCfg(false);
   } catch (e) {
@@ -369,6 +376,7 @@ function drawFit(img) {
   }
   baseData = ctx.getImageData(0, 0, W, H);
   render();
+  syncRes();
 }
 function render() {
   if (!baseData) return;
@@ -411,8 +419,68 @@ function planFull(iw, ih, extra) {
   else if (mode === 'stretch') { w0 = Math.max(iw, ih * 4 / 3); h0 = w0 * 3 / 4; }
   else { const s = Math.max(W / iw, H / ih) * crop.z; w0 = W / s; h0 = H / s; }   // crop: ukuran area terpilih dalam piksel asli
   const c = Math.min(capScale(w0, h0), extra);
-  if (ratio43) { const w = Math.max(W, Math.floor(w0 * c / 4) * 4); return { w, h: w * 3 / 4, w0, h0, mode }; }
-  return { w: Math.max(1, Math.round(w0 * c)), h: Math.max(1, Math.round(h0 * c)), w0, h0, mode };
+  if (ratio43) { const w = Math.max(W, Math.floor(w0 * c / 4) * 4); return { w, h: w * 3 / 4, w0, h0, mode, ratio43 }; }
+  return { w: Math.max(1, Math.round(w0 * c)), h: Math.max(1, Math.round(h0 * c)), w0, h0, mode, ratio43 };
+}
+
+// Perkecil rencana p dengan faktor c (rasio 4:3 tetap tepat 4:3, minimal seukuran layar)
+function scalePlan(p, c) {
+  if (p.ratio43) { const w = Math.max(W, Math.floor(p.w * c / 4) * 4); return { ...p, w, h: w * 3 / 4 }; }
+  return { ...p, w: Math.max(1, Math.round(p.w * c)), h: Math.max(1, Math.round(p.h * c)) };
+}
+
+// Ukuran thumbnail (pas di layar); harus sama dengan hitungan di ESP32
+function thumbDims(w, h) {
+  const fit = Math.min(W / w, H / h);
+  return { tw: Math.max(1, Math.min(W, Math.round(w * fit))), th: Math.max(1, Math.min(H, Math.round(h * fit))) };
+}
+
+/* ---------- pilihan resolusi ---------- */
+let devCap = null;    // kapasitas penyimpanan ESP32 (byte), diketahui setelah terhubung
+const fmtMB = b => (b / 1048576).toFixed(2).replace('.', ',') + ' MB';
+
+// Daftar pilihan dari tertinggi (resolusi asli, maks Full HD) sampai terkecil (seukuran layar)
+function resOptions(iw, ih) {
+  const top = planFull(iw, ih, 1);
+  const topA = top.w * top.h;
+  const small = top.ratio43 ? scalePlan(top, 0) : scalePlan(top, Math.min(W / top.w, H / top.h));
+  const smallA = small.w * small.h;
+  const seen = new Set([top.w + 'x' + top.h]), out = [top];
+  for (const o of [0.75, 0.5, 0.35, 0.25, 0.15].map(f => scalePlan(top, f)).concat([small])) {
+    const a = o.w * o.h, k = o.w + 'x' + o.h;
+    if (a > topA || a < smallA || seen.has(k)) continue;   // tidak pernah di atas resolusi tertinggi
+    seen.add(k); out.push(o);
+  }
+  out.sort((a, b) => b.w * b.h - a.w * a.h);
+  out[0].tag = capScale(top.w0, top.h0) < 1 ? 'maks Full HD (dikompres)' : 'asli';
+  const last = out[out.length - 1];
+  if (out.length > 1 && last.w === small.w && last.h === small.h) last.tag = 'seukuran layar';
+  return out;
+}
+
+let resSig = '';
+function syncRes() {
+  const sel = $('resSel');
+  if (!imgSource) { sel.disabled = true; return; }
+  const iw = imgSource.naturalWidth || imgSource.width, ih = imgSource.naturalHeight || imgSource.height;
+  const opts = resOptions(iw, ih);
+  const labels = opts.map(o => {
+    const t = thumbDims(o.w, o.h);
+    let l = o.w + '\u00D7' + o.h + ' \u00B7 ' + fmtMB((o.w * o.h + t.tw * t.th) * 2);
+    if (o.tag) l += ' \u00B7 ' + o.tag;
+    if (devCap !== null && o.w * o.h > (devCap - W * H * 2) / 2) l += ' \u00B7 melebihi penyimpanan, diturunkan otomatis';
+    return l;
+  });
+  const sig = labels.join('|');
+  if (sig !== resSig) {                       // bangun ulang hanya kalau daftar berubah
+    const had = resSig !== '' && sel.options.length > 1;
+    const wasLast = had && sel.selectedIndex === sel.options.length - 1;
+    const prev = Math.max(0, sel.selectedIndex);
+    sel.innerHTML = labels.map((l, i) => '<option value="' + i + '">' + l + '</option>').join('');
+    sel.selectedIndex = wasLast ? opts.length - 1 : Math.min(prev, opts.length - 1);
+    resSig = sig;
+  }
+  sel.disabled = busy || opts.length < 2;
 }
 
 function drawFull(img, p) {
@@ -442,8 +510,7 @@ function applyGamma(c) {
 
 // Thumbnail seukuran layar (dipakai ESP32 saat zoom 1x), diperkecil bertahap supaya halus
 function makeThumb(c) {
-  const fit = Math.min(W / c.width, H / c.height);
-  const tw = Math.max(1, Math.min(W, Math.round(c.width * fit))), th = Math.max(1, Math.min(H, Math.round(c.height * fit)));
+  const { tw, th } = thumbDims(c.width, c.height);
   let cur = c;
   while ((cur.width >> 1) >= tw && (cur.height >> 1) >= th) {
     const n = document.createElement('canvas'); n.width = cur.width >> 1; n.height = cur.height >> 1;
@@ -460,7 +527,7 @@ const WINDOW = 12288;   // maksimal byte terkirim yang belum dikonfirmasi ESP32
 
 async function sendImage() {
   if (!connected || !imgSource || busy) return;
-  busy = true; refreshButtons();
+  busy = true; refreshButtons(); syncRes();
   $('prog').style.width = '0%';
   acked = 0; rejected = false;
   try {
@@ -468,13 +535,16 @@ async function sendImage() {
     const cap = await queryCap();
     const budget = (cap - W * H * 2) / 2;        // piksel yang muat, sisakan tempat thumbnail
     if (budget < W * H) throw new Error('penyimpanan ESP32 hanya ' + cap + ' byte. Pilih Partition Scheme dengan LittleFS/SPIFFS lebih besar');
+    devCap = cap;
     const iw = imgSource.naturalWidth || imgSource.width, ih = imgSource.naturalHeight || imgSource.height;
-    const p0 = planFull(iw, ih, 1);
-    let p = p0;
-    if (p0.w * p0.h > budget) p = planFull(iw, ih, Math.sqrt(budget / (p0.w0 * p0.h0)) * 0.995);
-    if (p.w * p.h < p0.w * p0.h) log('Penyimpanan ESP32 terbatas (' + (cap / 1048576).toFixed(2) + ' MB): resolusi diturunkan ke ' + p.w + 'x' + p.h, 'err');
-    else if (capScale(p0.w0, p0.h0) < 1) log('Di atas Full HD: dikompres ke ' + p.w + 'x' + p.h);
-    else log('Resolusi dikirim penuh: ' + p.w + 'x' + p.h);
+    const opts = resOptions(iw, ih);
+    const idx = Math.min(Math.max(0, parseInt($('resSel').value, 10) || 0), opts.length - 1);
+    const pick = opts[idx];
+    let p = pick;
+    if (p.w * p.h > budget) p = scalePlan(p, Math.sqrt(budget / (p.w * p.h)) * 0.995);
+    if (p.w * p.h < pick.w * pick.h) log('Penyimpanan ESP32 terbatas (' + fmtMB(cap) + '): resolusi diturunkan ke ' + p.w + 'x' + p.h, 'err');
+    else if (idx === 0 && capScale(pick.w0, pick.h0) < 1) log('Di atas Full HD: dikompres ke ' + p.w + 'x' + p.h);
+    else log('Resolusi dikirim: ' + p.w + 'x' + p.h + (idx === 0 ? ' (tertinggi)' : ''));
 
     const full = drawFull(imgSource, p);
     const fullData = applyGamma(full);
@@ -518,7 +588,7 @@ async function sendImage() {
   } catch (e) {
     log('Gagal mengirim gambar: ' + e.message, 'err');
   } finally {
-    busy = false; refreshButtons();
+    busy = false; refreshButtons(); syncRes();
   }
 }
 
